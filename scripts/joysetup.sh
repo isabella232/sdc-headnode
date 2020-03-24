@@ -43,6 +43,19 @@ set -o pipefail
 export PS4='[\D{%FT%TZ}] ${BASH_SOURCE}:${LINENO}: ${FUNCNAME[0]:+${FUNCNAME[0]}(): }'
 set -o xtrace
 
+# Get the OS type.
+OS_TYPE=$(uname -s)
+
+if [[ $OS_TYPE == "SunOS" ]]; then
+    BASEDIR=/opt/smartos
+elif [[ $OS_TYPE == "Linux" ]]; then
+    BASEDIR=/usr/triton
+    # Put the triton tooling on the path.
+    export PATH=$PATH:/usr/node/bin:/usr/triton/bin
+    # Ensure the state directory exists.
+    mkdir -p "$BASEDIR/state"
+fi
+
 # bump to line past console login prompt
 echo "" >&4
 
@@ -116,9 +129,10 @@ fi
 }
 
 # Load SYSINFO_* and CONFIG_* values
-. /lib/sdc/config.sh
-load_sdc_sysinfo
-load_sdc_config
+if [[ $OS_TYPE == "SunOS" ]]; then
+    . /lib/sdc/config.sh
+    load_sdc_sysinfo
+    load_sdc_config
 fi
 
 ENCRYPTION=
@@ -133,14 +147,9 @@ fatal()
 
 function ceil
 {
-    x=$1
-
-    # ksh93 supports a bunch of math functions that don't exist in bash.
-    # including floating point stuff.
-    expression="echo \$((ceil(${x})))"
-    result=$(ksh93 -c "${expression}")
-
-    echo ${result}
+    # We use awk '%.f' to convert the floating point to integer, the addition
+    # of 0.49999 is used to round up numbers less that 0.5.
+    awk 'BEGIN{printf("%.f\n", $1 + 0.49999999)}'
 }
 
 function check_ntp
@@ -179,9 +188,11 @@ function check_ntp
         fatal "Cannot find any servers to sync with using NTP."
     fi
 
-    # NTP needs to be off and we don't bother turning it back on because we're
-    # going to reboot when everything is ok.
-    /usr/sbin/svcadm disable svc:/network/ntp:default
+    if [[ $OS_TYPE == "SunOS" ]]; then
+        # NTP needs to be off and we don't bother turning it back on because we're
+        # going to reboot when everything is ok.
+        /usr/sbin/svcadm disable svc:/network/ntp:default
+    fi
 
     # Poll on headnode ntp availability.
 
@@ -252,6 +263,9 @@ SETUP_FILE=/var/lib/setup.json
 if [[ -n ${MOCKCN} ]]; then
     SETUP_FILE="/mockcn/${MOCKCN_SERVER_UUID}/setup.json"
 fi
+if [[ $OS_TYPE == "Linux" ]]; then
+    SETUP_FILE="${BASEDIR}/state/triton-setup.json"
+fi
 
 function create_setup_file
 {
@@ -286,9 +300,10 @@ function update_setup_state
 function check_disk_space
 {
     local pool_json="$1"
-    local RAM_MiB=${SYSINFO_MiB_of_Memory}
+    # local RAM_MiB=${SYSINFO_MiB_of_Memory}
+    local RAM_MiB=$(sysinfo | json 'MiB of Memory')
     local space
-    space=$(/usr/bin/json capacity < ${pool_json})
+    space=$(json capacity < ${pool_json})
     local Disk_MiB
     Disk_MiB=$(( $space / 1024 / 1024 ))
     local msg
@@ -321,7 +336,8 @@ function swap_in_GiB
     swap=$(echo $1 | tr [:upper:] [:lower:])
 
     # Find system RAM for multiple
-    RAM_MiB=${SYSINFO_MiB_of_Memory}
+    # RAM_MiB=${SYSINFO_MiB_of_Memory}
+    local RAM_MiB=$(sysinfo | json 'MiB of Memory')
     RAM_GiB=$(ceil "${RAM_MiB} / 1024.0")
 
     swap_val=${swap%?}      # number
@@ -371,7 +387,7 @@ function create_zpool
 
     if ! /usr/sbin/zpool list -H -o name $SYS_ZPOOL; then
         printf "%-56s" "creating pool: $SYS_ZPOOL" >&4
-        if ! /usr/bin/mkzpool ${e_flag} ${SYS_ZPOOL} ${POOL_JSON}; then
+        if ! mkzpool ${e_flag} ${SYS_ZPOOL} ${POOL_JSON}; then
             printf "%6s\n" "failed" >&4
             fatal "failed to create pool"
         fi
@@ -384,8 +400,10 @@ function create_zpool
 
     printf "%4s\n" "done" >&4
 
-    svccfg -s svc:/system/smartdc/init setprop config/zpool=${SYS_ZPOOL}
-    svccfg -s svc:/system/smartdc/init:default refresh
+    if [[ $OS_TYPE == "SunOS" ]]; then
+        svccfg -s svc:/system/smartdc/init setprop config/zpool=${SYS_ZPOOL}
+        svccfg -s svc:/system/smartdc/init:default refresh
+    fi
 
     export CONFDS=${SYS_ZPOOL}/config
     export COREDS=${SYS_ZPOOL}/cores
@@ -408,8 +426,8 @@ function create_zpool
 #
 create_dump()
 {
-    local dumpsize
-    dumpsize=$(( ${SYSINFO_MiB_of_Memory} / 2 ))
+    local RAM_MiB=$(sysinfo | json 'MiB of Memory')
+    local dumpsize=$(( ${RAM_MiB} / 2 ))
 
     local encr_opt
 
@@ -452,7 +470,9 @@ setup_datasets()
         printf "%-56s" "adding volume: config" >&4
         zfs create ${CONFDS} || fatal "failed to create the config dataset"
         chmod 755 /${CONFDS}
-        cp -p /etc/zones/* /${CONFDS}
+        if [[ -d /etc/zones ]]; then
+            cp -p /etc/zones/* /${CONFDS}
+        fi
         zfs set mountpoint=legacy ${CONFDS}
         printf "%4s\n" "done" >&4
     fi
@@ -602,7 +622,7 @@ output_zpool_info()
 # plus authorized keys and anything else we want
 install_configs()
 {
-    SMARTDC=/opt/smartdc/config
+    SMARTDC_CONFIG="${BASEDIR}/config"
 
     # On standalone machines we don't get config in /var/tmp
     if [[ -n $(/usr/bin/bootparams | grep "^standalone=true") ]]; then
@@ -624,19 +644,26 @@ install_configs()
         # mount /opt before doing this or changes are not going to be persistent
         mount -F zfs ${SYS_ZPOOL}/opt /opt || echo "/opt already mounted"
 
-        mkdir -p /opt/smartdc/
-        mv $TEMP_CONFIGS $SMARTDC
+        mkdir -p "${BASEDIR}"
+        mv $TEMP_CONFIGS $SMARTDC_CONFIG
         printf "%4s\n" "done" >&4
 
         # re-load config here, since it will have just changed
         # (also location will be detected properly now)
         SDC_CONFIG_FILENAME=
-        load_sdc_config
+        if [[ $OS_TYPE == "SunOS" ]]; then
+            load_sdc_config
+        fi
     fi
 }
 
 setup_filesystems()
 {
+    if [[ $OS_TYPE != "SunOS" ]]; then
+        echo "Not setting up filesystems on ${OS_TYPE}."
+        return;
+    fi
+
     if [[ -n ${MOCKCN} ]]; then
         echo "Not setting up filesystems on mock CN."
         return;
@@ -699,7 +726,7 @@ if [[ "$(zpool list)" == "no pools available" ]] \
         dl5="${CONFIG_layout}"
     fi
 
-    if ! /usr/bin/disklayout ${dl0} ${dl1:+"$dl1"} ${dl2} \
+    if ! disklayout ${dl0} ${dl1:+"$dl1"} ${dl2} \
 	${dl3} ${dl4:+"$dl4"} "${dl5}" > ${POOL_FILE}; then
         fatal "disk layout failed"
     fi
@@ -732,6 +759,13 @@ if [[ "$(zpool list)" == "no pools available" ]] \
 
     setup_filesystems
     update_setup_state "filesystems_setup"
+
+    if [[ $OS_TYPE != "SunOS" ]]; then
+        # Nothing below here needs to run for other OS's.
+        # TODO: Do we need the imgadm setup steps?
+        update_setup_state "imgadm_setup"
+        exit 0
+    fi
 
     if [[ -n ${MOCKCN} ]]; then
         # nothing below here needs to run for mock CN
